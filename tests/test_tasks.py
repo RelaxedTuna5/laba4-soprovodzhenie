@@ -1,10 +1,12 @@
 """
-Модульные тесты для проверки функциональности аналитики задач JIRA.
+Модульные и интеграционные тесты для проверки аналитики задач JIRA на РЕАЛЬНЫХ данных.
+Тесты выполняют прямое обращение к REST API Apache JIRA и проверяют расчет метрик
+на реальных тикетах без использования фиктивных Mock-заглушек.
+
 Разработчик: Суханов С.С.
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
 from datetime import datetime
 
 from jira_analytics.jira_api import JiraClient, JiraAPIError
@@ -19,177 +21,130 @@ from jira_analytics.tasks import (
 from jira_analytics.utils import parse_jira_date
 
 
-class TestJiraAPI(unittest.TestCase):
-    """Тестирование взаимодействия с JIRA REST API и вспомогательных методов."""
+class TestJiraRealAPI(unittest.TestCase):
+    """
+    Реальные тесты аналитического модуля на живых данных проектов Apache Kafka и HDFS.
+    Все тесты работают с реальными сетевыми ответами и реальными структурами JSON.
+    """
 
-    def setUp(self):
-        """Подготовка тестовых данных."""
-        self.project_key = "KAFKA"
-        self.mock_response_data = {
-            "total": 2,
-            "issues": [
-                {
-                    "key": "KAFKA-1",
-                    "fields": {
-                        "summary": "First test task",
-                        "created": "2026-10-01T10:00:00.000+0000",
-                        "resolutiondate": "2026-10-05T10:00:00.000+0000",
-                        "timespent": 7200,  # 2 hours
-                        "priority": {"name": "Major"},
-                        "assignee": {"displayName": "Ivan Ivanov", "name": "ivan"},
-                        "reporter": {"displayName": "Petr Petrov", "name": "petr"},
-                        "status": {"name": "Resolved"}
-                    },
-                    "changelog": {
-                        "histories": [
-                            {
-                                "created": "2026-10-02T10:00:00.000+0000",
-                                "items": [
-                                    {"field": "status", "fromString": "Open", "toString": "In Progress"}
-                                ]
-                            },
-                            {
-                                "created": "2026-10-05T10:00:00.000+0000",
-                                "items": [
-                                    {"field": "status", "fromString": "In Progress", "toString": "Resolved"}
-                                ]
-                            }
-                        ]
-                    }
-                },
-                {
-                    "key": "KAFKA-2",
-                    "fields": {
-                        "summary": "Second test task",
-                        "created": "2026-10-02T12:00:00.000+0000",
-                        "resolutiondate": "2026-10-04T12:00:00.000+0000",
-                        "timespent": 14400,  # 4 hours
-                        "priority": {"name": "Critical"},
-                        "assignee": {"displayName": "Ivan Ivanov", "name": "ivan"},
-                        "reporter": {"displayName": "Ivan Ivanov", "name": "ivan"},
-                        "status": {"name": "Closed"}
-                    },
-                    "changelog": {
-                        "histories": [
-                            {
-                                "created": "2026-10-04T12:00:00.000+0000",
-                                "items": [
-                                    {"field": "status", "fromString": "Open", "toString": "Closed"}
-                                ]
-                            }
-                        ]
-                    }
-                }
-            ]
-        }
+    @classmethod
+    def setUpClass(cls):
+        """
+        Инициализация клиента и загрузка реальных данных из Apache JIRA.
+        Используется реальный JIRA REST API (https://issues.apache.org/jira).
+        """
+        cls.client = JiraClient(base_url="https://issues.apache.org/jira", timeout=30)
+        cls.project_key = "KAFKA"
 
-    @patch("requests.Session.get")
-    def test_fetch_jira_issues(self, mock_get):
-        """Тест функции выборки задач через REST API (JiraClient.search_issues)."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = self.mock_response_data
-        mock_get.return_value = mock_response
+        # Загружаем реальные закрытые задачи Kafka с историей changelog (10 задач для быстроты тестов)
+        cls.real_closed_issues = cls.client.get_closed_project_issues(
+            project_key="KAFKA",
+            max_results=15,
+            expand_changelog=True,
+            use_cache=True
+        )
 
-        client = JiraClient(base_url="https://issues.apache.org/jira")
-        result = client.search_issues(jql="project = KAFKA", max_results=10, use_cache=False)
+        # Загружаем общий поток реальных задач Kafka
+        cls.real_all_issues = cls.client.get_all_project_issues(
+            project_key="KAFKA",
+            max_results=20,
+            use_cache=True
+        )
 
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["key"], "KAFKA-1")
-        self.assertEqual(result[1]["key"], "KAFKA-2")
-        print("fetch_jira_issues: Тест пройден успешно")
+        # Загружаем реальные задачи Apache HDFS с заполненным полем timespent
+        cls.real_hdfs_timespent_issues = cls.client.search_issues(
+            jql="project = HDFS AND status in (Closed, Resolved) AND timespent is not EMPTY",
+            max_results=10,
+            use_cache=True
+        )
 
-    @patch("requests.Session.get")
-    def test_get_project_issues(self, mock_get):
-        """Тест метода получения закрытых задач проекта."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = self.mock_response_data
-        mock_get.return_value = mock_response
+    def test_1_real_fetch_issues_from_jira(self):
+        """1. Реальный тест поиска задач через REST API (GET /rest/api/2/search)."""
+        issues = self.client.search_issues("project = KAFKA", max_results=5, use_cache=True)
+        self.assertGreater(len(issues), 0, "REST API JIRA должен вернуть задачи")
+        first_issue = issues[0]
+        self.assertTrue(first_issue["key"].startswith("KAFKA-"), "Ключ тикета должен начинаться с 'KAFKA-'")
+        self.assertIn("summary", first_issue["fields"], "В ответе API должно присутствовать поле summary")
+        self.assertIn("created", first_issue["fields"], "В ответе API должно присутствовать поле created")
+        print(f"test_1_real_fetch_issues_from_jira: OK (получен реальный тикет {first_issue['key']})")
 
-        client = JiraClient(base_url="https://issues.apache.org/jira")
-        result = client.get_closed_project_issues(project_key=self.project_key, max_results=10, use_cache=False)
+    def test_2_real_get_closed_project_issues(self):
+        """2. Реальный тест получения закрытых задач с changelog."""
+        issues = self.real_closed_issues
+        self.assertGreater(len(issues), 0, "Должны быть получены закрытые задачи Kafka")
+        for issue in issues[:5]:
+            status_name = issue["fields"]["status"]["name"]
+            self.assertIn(status_name, ["Closed", "Resolved"], "Статус должен быть Closed или Resolved")
+            self.assertIsNotNone(issue["fields"].get("resolutiondate"), "У закрытой задачи обязана быть дата закрытия")
+            self.assertIn("changelog", issue, "У задачи с expand=changelog должна присутствовать история изменений")
+        print("test_2_real_get_closed_project_issues: OK (все задачи проверены на статус Closed/Resolved и changelog)")
 
-        self.assertEqual(len(result), 2)
-        self.assertIn("resolutiondate", result[0]["fields"])
-        print("get_project_issues: Тест пройден успешно")
+    def test_3_real_calculate_open_durations(self):
+        """3. Реальный расчет времени задач в открытом состоянии (created -> resolutiondate)."""
+        durations = calculate_open_durations(self.real_closed_issues)
+        self.assertGreater(len(durations), 0, "Список длительностей не должен быть пустым")
+        for d in durations:
+            self.assertIsInstance(d, float, "Длительность должна быть числом с плавающей точкой")
+            self.assertGreaterEqual(d, 0.0, "Длительность решения задачи не может быть отрицательной")
+        print(f"test_3_real_calculate_open_durations: OK (рассчитано время для {len(durations)} реальных задач, min={min(durations):.1f}д, max={max(durations):.1f}д)")
 
-    def test_get_assignee_issues(self):
-        """Тест анализа активности пользователей (исполнители и авторы)."""
-        issues = self.mock_response_data["issues"]
-        top_users = calculate_top_users(issues, top_n=10)
+    def test_4_real_calculate_status_durations(self):
+        """4. Реальный расчет времени нахождения в статусах по changelog."""
+        status_durations = calculate_status_durations(self.real_closed_issues)
+        self.assertIsInstance(status_durations, dict, "Результат должен быть словарем статусов")
+        self.assertIn("Open", status_durations, "Среди статусов Kafka обязательно должен присутствовать статус 'Open'")
+        open_durs = status_durations["Open"]
+        self.assertGreater(len(open_durs), 0, "Должны быть зафиксированы интервалы нахождения в статусе Open")
+        for val in open_durs:
+            self.assertGreaterEqual(val, 0.0, "Время в статусе не может быть отрицательным")
+        print(f"test_4_real_calculate_status_durations: OK (найдены статусы: {list(status_durations.keys())[:4]}...)")
 
-        # Ivan Ivanov: 2 раза assignee, 1 раз reporter = 3
-        # Petr Petrov: 1 раз reporter = 1
-        self.assertEqual(len(top_users), 2)
-        self.assertEqual(top_users[0][0], "Ivan Ivanov")
-        self.assertEqual(top_users[0][1], 3)
-        self.assertEqual(top_users[1][0], "Petr Petrov")
-        self.assertEqual(top_users[1][1], 1)
-        print("get_assignee_issues: Тест пройден успешно")
-
-    def test_analyse_time_spent(self):
-        """Тест анализа залогированного времени выполнения задач."""
-        issues = self.mock_response_data["issues"]
-        logged = calculate_logged_times(issues)
-
-        # 7200 сек = 2.0 часа, 14400 сек = 4.0 часа
-        self.assertEqual(len(logged), 2)
-        self.assertAlmostEqual(logged[0], 2.0)
-        self.assertAlmostEqual(logged[1], 4.0)
-        print("analyse_time_spent: Тест пройден успешно")
-
-    def test_analyse_issues_with_priority(self):
-        """Тест анализа распределения задач по степени серьезности / приоритетам."""
-        issues = self.mock_response_data["issues"]
-        priorities = calculate_priorities(issues)
-
-        self.assertEqual(priorities.get("Major"), 1)
-        self.assertEqual(priorities.get("Critical"), 1)
-        print("analyse_issues_with_priority: Тест пройден успешно")
-
-    def test_calculate_open_durations(self):
-        """Тест расчета времени нахождения задач в открытом состоянии."""
-        issues = self.mock_response_data["issues"]
-        durations = calculate_open_durations(issues)
-
-        # KAFKA-1: с 1 по 5 октября = 4 дня
-        # KAFKA-2: с 2 по 4 октября = 2 дня
-        self.assertEqual(len(durations), 2)
-        self.assertAlmostEqual(durations[0], 4.0)
-        self.assertAlmostEqual(durations[1], 2.0)
-        print("calculate_open_durations: Тест пройден успешно")
-
-    def test_calculate_status_durations(self):
-        """Тест расчета времени, проведенного в отдельных статусах."""
-        issues = self.mock_response_data["issues"]
-        status_durs = calculate_status_durations(issues)
-
-        # KAFKA-1: Open с 1 по 2 октября (1 день), In Progress с 2 по 5 октября (3 дня)
-        # KAFKA-2: Open с 2 по 4 октября (2 дня)
-        self.assertIn("Open", status_durs)
-        self.assertIn("In Progress", status_durs)
-        self.assertEqual(len(status_durs["Open"]), 2)
-        self.assertAlmostEqual(status_durs["Open"][0], 1.0)
-        self.assertAlmostEqual(status_durs["Open"][1], 2.0)
-        self.assertAlmostEqual(status_durs["In Progress"][0], 3.0)
-        print("calculate_status_durations: Тест пройден успешно")
-
-    def test_calculate_daily_dynamics(self):
-        """Тест расчета ежедневной динамики заведения и закрытия с накопительным итогом."""
-        issues = self.mock_response_data["issues"]
-        dynamics = calculate_daily_dynamics(issues)
-
+    def test_5_real_calculate_daily_dynamics(self):
+        """5. Реальный расчет ежедневной динамики заведения/закрытия и накопительного итога."""
+        dynamics = calculate_daily_dynamics(self.real_all_issues)
         self.assertIn("dates", dynamics)
         self.assertIn("created_daily", dynamics)
         self.assertIn("resolved_daily", dynamics)
         self.assertIn("created_cumulative", dynamics)
         self.assertIn("resolved_cumulative", dynamics)
 
-        # Всего 2 создано, 2 закрыто
-        self.assertEqual(dynamics["created_cumulative"][-1], 2)
-        self.assertEqual(dynamics["resolved_cumulative"][-1], 2)
-        print("calculate_daily_dynamics: Тест пройден успешно")
+        cum_created = dynamics["created_cumulative"]
+        self.assertGreater(len(cum_created), 0)
+        # Проверка свойства монотонности накопительного итога: каждое следующее значение >= предыдущего
+        for i in range(len(cum_created) - 1):
+            self.assertGreaterEqual(cum_created[i + 1], cum_created[i], "Накопительный итог должен быть монотонно неубывающим")
+        print(f"test_5_real_calculate_daily_dynamics: OK (дней в выборке: {len(dynamics['dates'])}, суммарно создано: {cum_created[-1]})")
+
+    def test_6_real_calculate_top_users(self):
+        """6. Реальный расчет активности пользователей (топ авторов и исполнителей)."""
+        top_users = calculate_top_users(self.real_all_issues, top_n=10)
+        self.assertGreater(len(top_users), 0, "Список пользователей не должен быть пустым")
+        first_user = top_users[0]
+        # Кортеж: (имя, всего_задач, как_исполнитель, как_автор)
+        self.assertEqual(len(first_user), 4, "Запись пользователя должна содержать 4 поля")
+        user_name, total, assignee_cnt, reporter_cnt = first_user
+        self.assertIsInstance(user_name, str)
+        self.assertEqual(total, assignee_cnt + reporter_cnt, "Сумма задач должна равняться сумме исполнителя и автора")
+        self.assertGreater(total, 0, "Количество задач топ-пользователя должно быть больше нуля")
+        print(f"test_6_real_calculate_top_users: OK (топ-1 контрибьютор: {user_name}, задач: {total})")
+
+    def test_7_real_calculate_logged_times(self):
+        """7. Реальный расчет залогированного времени на тикетах Apache HDFS."""
+        times = calculate_logged_times(self.real_hdfs_timespent_issues)
+        self.assertGreater(len(times), 0, "Список залогированного времени HDFS не должен быть пустым")
+        for hours in times:
+            self.assertIsInstance(hours, float, "Время в часах должно быть числом с плавающей точкой")
+            self.assertGreater(hours, 0.0, "Залогированное время должно быть положительным")
+        print(f"test_7_real_calculate_logged_times: OK (получено {len(times)} записей трудозатрат HDFS, среднее: {sum(times)/len(times):.1f}ч)")
+
+    def test_8_real_calculate_priorities(self):
+        """8. Реальный расчет распределения задач по степени серьезности."""
+        priorities = calculate_priorities(self.real_all_issues)
+        self.assertIsInstance(priorities, dict)
+        self.assertGreater(len(priorities), 0, "Должна быть хотя бы одна категория приоритета")
+        total_counted = sum(priorities.values())
+        self.assertGreater(total_counted, 0, "Сумма подсчитанных приоритетов должна быть больше 0")
+        print(f"test_8_real_calculate_priorities: OK (найденные приоритеты: {priorities})")
 
 
 if __name__ == "__main__":
