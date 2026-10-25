@@ -14,9 +14,13 @@ from jira_analytics.tasks import (
     plot_open_duration_histogram,
     calculate_status_durations,
     plot_status_time_distribution,
+    calculate_daily_dynamics,
     plot_daily_dynamics,
+    calculate_top_users,
     plot_top_users,
+    calculate_logged_times,
     plot_logged_time_histogram,
+    calculate_priorities,
     plot_priority_distribution
 )
 
@@ -97,20 +101,27 @@ def run_full_pipeline(client: JiraClient, project_key: str, results_dir: str, fo
         print(f"  [-] Ошибка при построении графика 4: {e}")
 
     # График 5: Гистограмма времени выполнения задач (залогированное время)
-    try:
-        p5 = plot_logged_time_histogram(closed_issues, project_key,
-                                        save_path=os.path.join(proj_dir, "5_logged_time_spent_histogram.png"))
-        print(f"  [+] 5. Гистограмма залогированного времени построена: {p5}")
-    except Exception as e:
-        print(f"  [!] 5. {e}")
-        # Если в выбранном проекте (например Kafka) нет залогированного времени, автоматически анализируем HDFS/HADOOP
-        fallback_proj = "HDFS"
-        print(f"      -> Выполняем построение графика 5 на контрольном проекте Apache {fallback_proj}...")
+    times = calculate_logged_times(closed_issues)
+    if len(times) >= 10:
         try:
-            hdfs_issues = client.get_closed_project_issues(fallback_proj, max_results=300, expand_changelog=False)
+            p5 = plot_logged_time_histogram(closed_issues, project_key,
+                                            save_path=os.path.join(proj_dir, "5_logged_time_spent_histogram.png"))
+            print(f"  [+] 5. Гистограмма залогированного времени построена: {p5}")
+        except Exception as e:
+            print(f"  [-] Ошибка при построении графика 5: {e}")
+    else:
+        print(f"  [!] 5. В проекте {project_key} найдено всего {len(times)} задач с залогированным временем (нерепрезентативно).")
+        fallback_proj = "HDFS"
+        print(f"      -> Выполняем построение полноценного графика 5 на контрольном проекте Apache {fallback_proj} (выборка 'timespent is not EMPTY')...")
+        try:
+            hdfs_issues = client.search_issues(
+                f"project = {fallback_proj} AND status in (Closed, Resolved) AND timespent is not EMPTY ORDER BY created DESC",
+                max_results=300,
+                use_cache=True
+            )
             p5_fb = plot_logged_time_histogram(hdfs_issues, fallback_proj,
                                                save_path=os.path.join(proj_dir, f"5_logged_time_spent_{fallback_proj}.png"))
-            print(f"      [+] 5. Гистограмма залогированного времени успешно построена для {fallback_proj}: {p5_fb}")
+            print(f"      [+] 5. Полноценная гистограмма залогированного времени построена для {fallback_proj} ({len(hdfs_issues)} задач): {p5_fb}")
         except Exception as fb_err:
             print(f"      [-] Не удалось построить график для запасного проекта: {fb_err}")
 
@@ -219,20 +230,25 @@ def interactive_menu(client: JiraClient, default_project: str, results_dir: str)
         elif choice == "5":
             print(f"\nЗагрузка времени выполнения задач ({current_project})...")
             issues = client.get_closed_project_issues(current_project)
-            try:
+            times = calculate_logged_times(issues)
+            if len(times) >= 10:
                 path = plot_logged_time_histogram(issues, current_project,
                                                   save_path=os.path.join(proj_dir, "5_logged_time_spent_histogram.png"),
                                                   show=False)
                 print(f"[OK] График залогированного времени сохранен: {path}")
-            except ValueError as ve:
-                print(f"[!] {ve}")
-                alt = input("Хотите построить этот отчет для проекта HDFS/HADOOP? (y/n): ").strip().lower()
-                if alt == "y":
-                    alt_issues = client.get_closed_project_issues("HDFS")
-                    path = plot_logged_time_histogram(alt_issues, "HDFS",
-                                                      save_path=os.path.join(results_dir, "hdfs", "5_logged_time_spent_HDFS.png"),
+            else:
+                print(f"[!] В проекте {current_project} всего {len(times)} задач с залогированным временем (нерепрезентативно).")
+                alt = input("Построить полноценную гистограмму на контрольном проекте HDFS (300 задач)? (y/n): ").strip().lower()
+                if alt in ("y", "д", ""):
+                    hdfs_issues = client.search_issues(
+                        "project = HDFS AND status in (Closed, Resolved) AND timespent is not EMPTY ORDER BY created DESC",
+                        max_results=300,
+                        use_cache=True
+                    )
+                    path = plot_logged_time_histogram(hdfs_issues, "HDFS",
+                                                      save_path=os.path.join(proj_dir, "5_logged_time_spent_HDFS.png"),
                                                       show=False)
-                    print(f"[OK] График для HDFS сохранен: {path}")
+                    print(f"[OK] Полноценный график для HDFS сохранен: {path}")
         elif choice == "6":
             print(f"\nЗагрузка приоритетов ({current_project})...")
             issues = client.get_all_project_issues(current_project)
