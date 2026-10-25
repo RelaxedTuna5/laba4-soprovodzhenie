@@ -1,7 +1,6 @@
 @echo off
-chcp 65001 > nul
 echo ========================================================
-echo  Запуск аналитики задач JIRA (Суханов С.С., гр. 5140904/60401)
+echo  JIRA Task Analytics (Sukhanov S.S., gr. 5140904/60401)
 echo ========================================================
 python -m jira_analytics.main %*
 pause
